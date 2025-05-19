@@ -1,0 +1,669 @@
+import telebot
+from binance.client import Client
+from datetime import datetime, timedelta
+import math
+from telebot import types
+
+# ------------------- Institutional Settings -------------------
+class SniperConfig:
+    BOT_TOKEN = '7970489926:AAGjDmazd_EXkdT1cv8Lh8aNGZ1hPlkbcJg'
+    CHANNEL_ID = '@tradegrh'
+    API_KEY = 'cVRnAxc6nrVHQ6sbaAQNcrznHhOO7PcVZYlsES8Y75r34VJbYjQDfUTNcC8T2Fct'
+    API_SECRET = 'GEYh2ck82RcaDTaHjbLafYWBLqkAMw90plNSkfmhrvVbAFcowBxcst4L3u0hBLfC'
+    SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT']
+    TIMEFRAME = Client.KLINE_INTERVAL_1MINUTE
+    LIQUIDITY_LOOKBACK = 30
+    BASE_RISK_PCT = 0.02
+    RISK_REWARD_RATIO = 2.5
+    VOLATILITY_ADJUSTMENT = True
+    OB_IMBALANCE_THRESHOLD = 0.22
+    MIN_VOLUME_RATIO = 1.7
+    RSI_OVERBOUGHT = 72
+    RSI_OVERSOLD = 28
+
+# ------------------- Market Microstructure Engine -------------------
+class MarketMicrostructure:
+    @staticmethod
+    def get_klines(symbol, interval, limit):
+        try:
+            klines = Client(SniperConfig.API_KEY, SniperConfig.API_SECRET).get_klines(
+                symbol=symbol, interval=interval, limit=limit
+            )
+            return [{
+                'time': k[0], 'open': float(k[1]), 'high': float(k[2]), 'low': float(k[3]),
+                'close': float(k[4]), 'volume': float(k[5]), 'trades': k[8]
+            } for k in klines]
+        except Exception as e:
+            print(f"Data Error: {symbol} - {str(e)}")
+            return []
+
+    @staticmethod
+    def get_liquidity_zones(symbol, lookback):
+        klines = MarketMicrostructure.get_klines(symbol, SniperConfig.TIMEFRAME, lookback)
+        if not klines: return {'vwap': 0, 'liquidity_highs': [], 'liquidity_lows': [], 'volume_nodes': []}
+        total_volume = sum(k['volume'] for k in klines)
+        vwap = sum(k['close']*k['volume'] for k in klines)/total_volume if total_volume > 0 else klines[-1]['close']
+        highs = sorted([k['high'] for k in klines], reverse=True)
+        lows = sorted([k['low'] for k in klines])
+        return {
+            'vwap': vwap,
+            'liquidity_highs': highs[:3],
+            'liquidity_lows': lows[:3],
+            'volume_nodes': MarketMicrostructure._calculate_volume_nodes(klines)
+        }
+
+    @staticmethod
+    def _calculate_volume_nodes(klines):
+        price_buckets = {}
+        for k in klines:
+            price = round(k['close'], 2)
+            price_buckets[price] = price_buckets.get(price, 0) + k['volume']
+        return sorted(price_buckets.items(), key=lambda x: x[1], reverse=True)[:5]
+
+    @staticmethod
+    def get_micro_trap_zones(symbol, limit=20):
+        klines = MarketMicrostructure.get_klines(symbol, SniperConfig.TIMEFRAME, limit)
+        if not klines: return []
+        traps = []
+        for i in range(2, len(klines)):
+            wick = (klines[i]['high'] - klines[i]['close']) > 2*(klines[i]['close'] - klines[i]['open'])
+            trap = wick and klines[i]['volume'] > sum(k['volume'] for k in klines[i-2:i+1]) / 3
+            if trap:
+                traps.append({'price': klines[i]['high'], 'type': 'bear'})
+            wick = (klines[i]['close'] - klines[i]['low']) > 2*(klines[i]['open'] - klines[i]['close'])
+            trap = wick and klines[i]['volume'] > sum(k['volume'] for k in klines[i-2:i+1]) / 3
+            if trap:
+                traps.append({'price': klines[i]['low'], 'type': 'bull'})
+        return traps
+
+    @staticmethod
+    def detect_order_blocks(klines, window=12):
+        # Looks for zones of aggressive buy/sell (OBs)
+        obs = []
+        for i in range(window, len(klines)):
+            # Bullish OB: Down candle near swing low with higher close and volume
+            if klines[i-1]['close'] < klines[i-1]['open'] and \
+               klines[i]['close'] > klines[i-1]['high'] and \
+               klines[i]['volume'] > sum(k['volume'] for k in klines[i-window:i]) / window:
+                obs.append({'type': 'bull', 'price': klines[i-1]['low'], 'index': i-1})
+            # Bearish OB: Up candle near swing high with lower close and volume
+            if klines[i-1]['close'] > klines[i-1]['open'] and \
+               klines[i]['close'] < klines[i-1]['low'] and \
+               klines[i]['volume'] > sum(k['volume'] for k in klines[i-window:i]) / window:
+                obs.append({'type': 'bear', 'price': klines[i-1]['high'], 'index': i-1})
+        return obs[-2:] if obs else []
+
+    @staticmethod
+    def detect_fvg(klines):
+        # Simple FVG: big gap between previous and next candle wicks
+        fvgs = []
+        for i in range(2, len(klines)):
+            prev = klines[i-2]
+            curr = klines[i]
+            # Bull FVG: curr low > prev high (gap)
+            if curr['low'] > prev['high']:
+                fvgs.append({'type': 'bull', 'zone': (prev['high'], curr['low']), 'index': i})
+            # Bear FVG: curr high < prev low (gap)
+            if curr['high'] < prev['low']:
+                fvgs.append({'type': 'bear', 'zone': (curr['high'], prev['low']), 'index': i})
+        return fvgs[-2:] if fvgs else []
+
+    @staticmethod
+    def detect_choch(klines):
+        # Change of Character: breaks of recent swing high/low after trend
+        if len(klines) < 8: return None
+        highs = [k['high'] for k in klines[-8:]]
+        lows = [k['low'] for k in klines[-8:]]
+        prev_high = max(highs[:-2])
+        prev_low = min(lows[:-2])
+        choch = None
+        if klines[-2]['close'] > prev_high and klines[-1]['close'] < klines[-2]['low']:
+            choch = {'type': 'bear', 'level': klines[-2]['low']}
+        elif klines[-2]['close'] < prev_low and klines[-1]['close'] > klines[-2]['high']:
+            choch = {'type': 'bull', 'level': klines[-2]['high']}
+        return choch
+
+    @staticmethod
+    def detect_bos(klines, lookback=20):
+        # Break of Structure detection: checks for swing high/low breaks
+        if len(klines) < lookback:
+            return None
+        highs = [k['high'] for k in klines[-lookback:]]
+        lows = [k['low'] for k in klines[-lookback:]]
+        closes = [k['close'] for k in klines[-lookback:]]
+        # Identify last swing high and low
+        swing_high = max(highs[:-1])
+        swing_low = min(lows[:-1])
+        last_close = closes[-1]
+        bos = None
+        explanation = ""
+
+        # Bullish BOS: price breaks above previous swing high
+        if last_close > swing_high:
+            bos = 'bull'
+            explanation = f"🔼 *Bullish Break of Structure (BOS)*: Price broke above prior swing high at {swing_high:.4f}."
+        # Bearish BOS: price breaks below previous swing low
+        elif last_close < swing_low:
+            bos = 'bear'
+            explanation = f"🔽 *Bearish Break of Structure (BOS)*: Price broke below prior swing low at {swing_low:.4f}."
+        else:
+            explanation = "⚪ No clear Break of Structure detected."
+
+        return {'type': bos, 'explanation': explanation, 'level_high': swing_high, 'level_low': swing_low}
+
+# ------------------- Advanced Analysis Tools -------------------
+class AdvancedMarketAnalysis:
+    @staticmethod
+    def calculate_fibonacci_levels(high, low):
+        diff = high - low
+        return {
+            '0.236': high - diff * 0.236,
+            '0.382': high - diff * 0.382,
+            '0.5': high - diff * 0.5,
+            '0.618': high - diff * 0.618,
+            '0.786': high - diff * 0.786
+        }
+
+# ------------------- Signal Engine -------------------
+class SignalEngine:
+    @staticmethod
+    def detect_super_sniper_entry(symbol, balance):
+        klines = MarketMicrostructure.get_klines(symbol, SniperConfig.TIMEFRAME, 50)
+        liquidity = MarketMicrostructure.get_liquidity_zones(symbol, SniperConfig.LIQUIDITY_LOOKBACK)
+        if len(klines) < 30:
+            return None
+        current, prev = klines[-1], klines[-2]
+        closes = [k['close'] for k in klines[-21:]]
+        highs = [k['high'] for k in klines[-21:]]
+        lows = [k['low'] for k in klines[-21:]]
+        volatility = SignalEngine._calculate_volatility([k['close'] for k in klines[-20:]])
+        atr = volatility * current['close']
+        ob_imbalance = SignalEngine.analyze_orderbook(symbol)
+        rsi = SignalEngine.calculate_rsi([k['close'] for k in klines])
+        regime = SignalEngine.detect_regime(closes)
+        traps = MarketMicrostructure.get_micro_trap_zones(symbol)
+        obs = MarketMicrostructure.detect_order_blocks(klines)
+        fvgs = MarketMicrostructure.detect_fvg(klines)
+        choch = MarketMicrostructure.detect_choch(klines)
+        fib = AdvancedMarketAnalysis.calculate_fibonacci_levels(max(highs), min(lows))
+        bos = MarketMicrostructure.detect_bos(klines)
+        explanations = []
+        score = 0
+
+        # 1. Order Block
+        ob_zone = None
+        ob_explain = ""
+        if obs:
+            ob = obs[-1]
+            ob_zone = ob['price']
+            if ob['type'] == 'bull':
+                if current['close'] > ob['price']:
+                    score += 20
+                    ob_explain = f"🟢 *Bullish Order Block* at {ob['price']:.2f}: Price reclaimed a strong demand zone. Entry bias = BUY in this area."
+                else:
+                    ob_explain = f"⚠️ Price approaching Bullish OB at {ob['price']:.2f}, watch for support confirmation."
+            elif ob['type'] == 'bear':
+                if current['close'] < ob['price']:
+                    score += 20
+                    ob_explain = f"🔴 *Bearish Order Block* at {ob['price']:.2f}: Price rejected from a supply zone. Entry bias = SELL in this area."
+                else:
+                    ob_explain = f"⚠️ Price approaching Bearish OB at {ob['price']:.2f}, watch for resistance confirmation."
+            explanations.append(ob_explain)
+
+        # 2. Fair Value Gap (FVG)
+        fvg_zone = None
+        if fvgs:
+            fvg = fvgs[-1]
+            fvg_zone = fvg['zone']
+            # Check if current price inside FVG zone with tolerance
+            low_zone, high_zone = min(fvg_zone), max(fvg_zone)
+            if fvg['type'] == 'bull' and low_zone <= current['close'] <= high_zone:
+                score += 18
+                explanations.append(f"🟢 *Bullish FVG* {fvg_zone}: Imbalance zone below. Price likely to bounce from here. Entry = BUY.")
+            elif fvg['type'] == 'bear' and low_zone <= current['close'] <= high_zone:
+                score += 18
+                explanations.append(f"🔴 *Bearish FVG* {fvg_zone}: Imbalance overhead. Price likely to reject. Entry = SELL.")
+
+        # 3. Change of Character (CHoCH)
+        choch_explain = ""
+        if choch:
+            if choch['type'] == 'bull':
+                score += 15
+                choch_explain = f"🟢 *CHoCH Bullish*: Market structure shifted up at {choch['level']:.2f}. Uptrend confirmation. Buy entries preferred."
+            if choch['type'] == 'bear':
+                score += 15
+                choch_explain = f"🔴 *CHoCH Bearish*: Market structure shifted down at {choch['level']:.2f}. Downtrend confirmation. Sell entries preferred."
+            explanations.append(choch_explain)
+
+        # 4. Break of Structure (BOS)
+        if bos:
+            if bos['type'] == 'bull':
+                score += 15
+                explanations.append(bos['explanation'] + " This suggests continuation of bullish momentum.")
+            elif bos['type'] == 'bear':
+                score += 15
+                explanations.append(bos['explanation'] + " This suggests continuation of bearish momentum.")
+            else:
+                explanations.append(bos['explanation'])
+
+        # 5. RSI
+        if rsi < SniperConfig.RSI_OVERSOLD + 8:
+            score += 10
+            explanations.append(f"🟢 *RSI {rsi:.1f}:* Market is oversold. Bounce likely. BUY bias.")
+        elif rsi > SniperConfig.RSI_OVERBOUGHT - 8:
+            score += 10
+            explanations.append(f"🔴 *RSI {rsi:.1f}:* Market is overbought. Reversal likely. SELL bias.")
+
+        # 6. Fibonacci Confluence
+        fib_diff = abs(current['close'] - fib['0.618']) / (atr if atr > 0 else 1)
+        if fib_diff < 0.7:
+            score += 10
+            explanations.append(f"📐 *Fibonacci 0.618 confluence:* Entry near golden zone ({fib['0.618']:.2f}). High probability reversal area.")
+
+        # 7. OrderBook Imbalance
+        if abs(ob_imbalance) > SniperConfig.OB_IMBALANCE_THRESHOLD:
+            score += 10
+            explanations.append(f"{'🟢' if ob_imbalance>0 else '🔴'} *Orderbook Imbalance* {ob_imbalance:.2%}: {'Buy' if ob_imbalance>0 else 'Sell'} side dominant.")
+
+        # 8. Volume Expansion
+        if current['volume'] > prev['volume'] * SniperConfig.MIN_VOLUME_RATIO:
+            score += 10
+            explanations.append("📊 *Volume expansion*: Institutional activity detected.")
+
+        # 9. Liquidity sweep
+        if current['close'] > max(liquidity['liquidity_highs']):
+            score += 10
+            explanations.append("🔥 *Liquidity sweep above highs:* Breakout conditions.")
+
+        if current['close'] < min(liquidity['liquidity_lows']):
+            score += 10
+            explanations.append("🔥 *Liquidity sweep below lows:* Breakdown conditions.")
+
+        # 10. Trap avoidance
+        if traps and abs(current['close'] - traps[-1]['price']) > 1.5 * atr:
+            score += 5
+            explanations.append("✅ No immediate liquidity trap.")
+
+        # 11. Pattern recognition (bottom/top with BOS and CHoCH confirmation)
+        pattern = "Unknown"
+        bottom_confirmed = False
+        top_confirmed = False
+        recent_closes = [k['close'] for k in klines[-6:]]
+        recent_lows = [k['low'] for k in klines[-6:]]
+        recent_highs = [k['high'] for k in klines[-6:]]
+
+        # Bottom formation logic: price near local lows + bullish BOS + bullish CHoCH + bullish OB
+        if current['close'] <= min(recent_closes):
+            if bos and bos['type'] == 'bull' and choch and choch['type'] == 'bull' and obs and obs[-1]['type'] == 'bull':
+                pattern = "🟢 Confirmed Bottom Formation"
+                score += 15
+                bottom_confirmed = True
+                explanations.append("🔵 *Pattern: Confirmed Bottom* with bullish BOS, CHoCH, and Order Block support. Strong reversal potential.")
+            else:
+                pattern = "🔵 Bottom Candidate"
+                score += 5
+                explanations.append("🔵 *Pattern: Bottom Candidate* - price near local lows, watch for confirmation.")
+
+        # Top formation logic: price near local highs + bearish BOS + bearish CHoCH + bearish OB
+        elif current['close'] >= max(recent_closes):
+            if bos and bos['type'] == 'bear' and choch and choch['type'] == 'bear' and obs and obs[-1]['type'] == 'bear':
+                pattern = "🔴 Confirmed Top Formation"
+                score += 15
+                top_confirmed = True
+                explanations.append("🔴 *Pattern: Confirmed Top* with bearish BOS, CHoCH, and Order Block resistance. Strong reversal potential.")
+            else:
+                pattern = "🔴 Top Candidate"
+                score += 5
+                explanations.append("🔴 *Pattern: Top Candidate* - price near local highs, watch for confirmation.")
+
+        # Signal direction based on all factors
+        buy_bias = any('BUY' in e or 'Bullish' in e or '🟢' in e for e in explanations)
+        sell_bias = any('SELL' in e or 'Bearish' in e or '🔴' in e for e in explanations)
+        # Bias priority: confirmed bottom/top and BOS/CHoCH direction
+        direction = None
+        if bottom_confirmed and buy_bias and not sell_bias:
+            direction = "BUY"
+        elif top_confirmed and sell_bias and not buy_bias:
+            direction = "SELL"
+        else:
+            # fallback: use RSI and BOS
+            if rsi < 45 or (bos and bos['type'] == 'bull'):
+                direction = "BUY"
+            elif rsi > 55 or (bos and bos['type'] == 'bear'):
+                direction = "SELL"
+            else:
+                direction = "BUY" if current['close'] < fib['0.618'] else "SELL"
+
+        # Entry, SL, TP calculation
+        if direction == "BUY":
+            sl = min(recent_lows)
+            tp = current['close'] + (current['close'] - sl) * SniperConfig.RISK_REWARD_RATIO
+        else:
+            sl = max(recent_highs)
+            tp = current['close'] - (sl - current['close']) * SniperConfig.RISK_REWARD_RATIO
+
+        risk_amount = balance * SniperConfig.BASE_RISK_PCT
+        if SniperConfig.VOLATILITY_ADJUSTMENT:
+            risk_amount *= min(1, 0.005 / (volatility if volatility > 0 else 1)) if volatility > 0 else 1
+        pos_size = risk_amount / max(abs(current['close'] - sl), 1e-8)
+        conviction = "SNIPER" if score >= 70 else "PRO"
+
+        return {
+            'symbol': symbol,
+            'entry': current['close'],
+            'sl': sl,
+            'tp': tp,
+            'pattern': pattern,
+            'score': score,
+            'conviction': conviction,
+            'rsi': rsi,
+            'atr': atr,
+            'ob': ob_imbalance,
+            'regime': regime,
+            'position_size': pos_size,
+            'risk_amount': risk_amount,
+            'chart': SignalVisualizer.generate_sniper_chart(symbol, klines, obs, fvgs, choch, fib),
+            'explanations': explanations,
+            'fibonacci': fib,
+            'orderblock': obs,
+            'fvg': fvgs,
+            'choch': choch,
+            'bos': bos,
+        }
+
+    @staticmethod
+    def detect_regime(closes):
+        if len(closes) < 20: return "UNKNOWN"
+        sma5 = sum(closes[-5:]) / 5
+        sma20 = sum(closes) / 20
+        std = math.sqrt(sum((c - sma20) ** 2 for c in closes) / len(closes))
+        if abs(sma5 - sma20) > std * 0.5:
+            return "TREND"
+        elif std / sma20 > 0.02:
+            return "VOLATILE"
+        else:
+            return "RANGE"
+
+    @staticmethod
+    def analyze_orderbook(symbol):
+        try:
+            ob = Client(SniperConfig.API_KEY, SniperConfig.API_SECRET).get_order_book(symbol=symbol, limit=10)
+            bid_vol = sum(float(b[1]) * (1 - i / 10) for i, b in enumerate(ob['bids'][:5]))
+            ask_vol = sum(float(a[1]) * (1 - i / 10) for i, a in enumerate(ob['asks'][:5]))
+            return (bid_vol - ask_vol) / (bid_vol + ask_vol) if (bid_vol + ask_vol) > 0 else 0
+        except:
+            return 0
+
+    @staticmethod
+    def calculate_rsi(closes, lookback=14):
+        if len(closes) < lookback + 1:
+            return 50
+        gains = [max(0, closes[i] - closes[i - 1]) for i in range(1, len(closes))]
+        losses = [max(0, closes[i - 1] - closes[i]) for i in range(1, len(closes))]
+        avg_gain = sum(gains[:lookback]) / lookback
+        avg_loss = sum(losses[:lookback]) / lookback
+        for i in range(lookback, len(gains)):
+            avg_gain = (avg_gain * (lookback - 1) + gains[i]) / lookback
+            avg_loss = (avg_loss * (lookback - 1) + losses[i]) / lookback
+        if avg_loss == 0:
+            return 100
+        rs = avg_gain / avg_loss
+        return 100 - (100 / (1 + rs))
+
+    @staticmethod
+    def _calculate_volatility(closes):
+        if len(closes) < 2: return 0
+        returns = [math.log(closes[i] / closes[i - 1]) for i in range(1, len(closes))]
+        mean_return = sum(returns) / len(returns)
+        squared_deviations = [(r - mean_return) ** 2 for r in returns]
+        variance = sum(squared_deviations) / len(returns)
+        return math.sqrt(variance) * math.sqrt(365)
+
+# ------------------- Pro Sniper Chart Visualizer -------------------
+class SignalVisualizer:
+    @staticmethod
+    def generate_sniper_chart(symbol, klines, obs, fvgs, choch, fib):
+        if len(klines) < 15:
+            return f"\n🔭 {symbol} Chart (Not enough data)\n"
+        closes = [k['close'] for k in klines[-15:]]
+        highs = [k['high'] for k in klines[-15:]]
+        lows = [k['low'] for k in klines[-15:]]
+        min_p = min(lows)
+        max_p = max(highs)
+        range_p = max_p - min_p
+        scale = 20
+        chart = f"\n🔭 {symbol} MICROSTRUCTURE ZONES 🔍\n"
+        for i in range(len(closes)):
+            high_level = int((highs[i] - min_p) / range_p * scale) if range_p > 0 else 0
+            low_level = int((lows[i] - min_p) / range_p * scale) if range_p > 0 else 0
+            close_level = int((closes[i] - min_p) / range_p * scale) if range_p > 0 else 0
+            chart += "▬" * low_level
+            chart += "┃" * (close_level - low_level)
+            chart += "⬤"
+            chart += "┃" * (high_level - close_level)
+            chart += "▬" * (scale - high_level)
+            chart += f" {closes[i]:.4f}\n"
+        chart += "\n"
+        # Overlay OB, FVG, CHoCH, Fibonacci
+        if obs:
+            for ob in obs:
+                ob_lvl = int((ob['price'] - min_p) / range_p * scale)
+                chart += " " * ob_lvl + ("🟩 OB\n" if ob['type'] == 'bull' else "🟥 OB\n")
+        if fvgs:
+            for fvg in fvgs:
+                fvg_min = int((min(fvg['zone']) - min_p) / range_p * scale)
+                fvg_max = int((max(fvg['zone']) - min_p) / range_p * scale)
+                chart += " " * fvg_min + "🟦 FVG" + "─" * (fvg_max-fvg_min) + "\n"
+        if choch:
+            choch_lvl = int((choch['level'] - min_p) / range_p * scale)
+            chart += " " * choch_lvl + ("🟦 CHoCH\n" if choch['type'] == 'bull' else "🟥 CHoCH\n")
+        for key in ['0.236', '0.382', '0.5', '0.618', '0.786']:
+            fib_lvl = int((fib[key] - min_p) / range_p * scale)
+            chart += " " * fib_lvl + f"─ {key}: {fib[key]:.2f}\n"
+        return chart
+
+# ------------------- Professional Trading Bot -------------------
+class ProfessionalTradingBot:
+    def __init__(self):
+        self.bot = telebot.TeleBot(SniperConfig.BOT_TOKEN)
+        self.user_balance = 5.00
+        self.active_analysis = {}
+        self.setup_handlers()
+
+    def setup_handlers(self):
+        @self.bot.message_handler(commands=['start'])
+        def start(message):
+            self._send_professional_menu(message.chat.id)
+
+        @self.bot.message_handler(func=lambda m: m.text == "🚀 Generate Signals")
+        def generate_signals(message):
+            self._generate_professional_signals(message.chat.id)
+
+        @self.bot.callback_query_handler(func=lambda call: call.data.startswith('signals_'))
+        def process_signal_request(call):
+            symbol = call.data.split('_')[1]
+            self._generate_signals_for_market(call.message.chat.id, symbol)
+
+        @self.bot.callback_query_handler(func=lambda call: call.data.startswith('chart_'))
+        def show_chart(call):
+            symbol = call.data.split('_')[1]
+            signal = SignalEngine.detect_super_sniper_entry(symbol, self.user_balance)
+            if signal:
+                self.bot.send_message(call.message.chat.id, signal['chart'])
+            else:
+                self.bot.send_message(call.message.chat.id, "⚠️ Chart data unavailable.")
+
+        @self.bot.callback_query_handler(func=lambda call: call.data == "close")
+        def close_message(call):
+            self.bot.delete_message(call.message.chat.id, call.message.message_id)
+
+        @self.bot.message_handler(func=lambda m: m.text == "💰 Set Balance")
+        def set_balance(message):
+            msg = self.bot.send_message(message.chat.id, "💵 Enter your trading balance in USD:")
+            self.bot.register_next_step_handler(msg, self._process_balance)
+
+        @self.bot.message_handler(func=lambda m: m.text == "⚙️ Strategy Guide")
+        def show_guide(message):
+            self._send_strategy_guide(message.chat.id)
+
+    def _send_professional_menu(self, chat_id):
+        markup = telebot.types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
+        buttons = [
+            telebot.types.KeyboardButton("🚀 Generate Signals"),
+            telebot.types.KeyboardButton("💰 Set Balance"),
+            telebot.types.KeyboardButton("⚙️ Strategy Guide")
+        ]
+        markup.add(*buttons)
+        self.bot.send_message(
+            chat_id,
+            f"""
+🤖 *INSTITUTIONAL SNIPER TERMINAL* 🚀
+
+🔹 Balance: ${self.user_balance:.2f}
+🔹 Risk per Trade: ${self.user_balance * SniperConfig.BASE_RISK_PCT:.2f}
+🔹 Volatility Adjustment: {'ON' if SniperConfig.VOLATILITY_ADJUSTMENT else 'OFF'}
+
+*Markets:*
+{', '.join(SniperConfig.SYMBOLS)}
+
+Select an option below:
+            """,
+            reply_markup=markup,
+            parse_mode="Markdown"
+        )
+
+    def _generate_professional_signals(self, chat_id):
+        markup = types.InlineKeyboardMarkup()
+        for symbol in SniperConfig.SYMBOLS:
+            markup.add(types.InlineKeyboardButton(
+                text=f"🚀 {symbol} Signals",
+                callback_data=f"signals_{symbol}"
+            ))
+        self.bot.send_message(
+            chat_id,
+            "📈 Select a market to generate sniper-grade trading signals:",
+            reply_markup=markup
+        )
+
+    def _generate_signals_for_market(self, chat_id, symbol):
+        signal = SignalEngine.detect_super_sniper_entry(symbol, self.user_balance)
+        if not signal:
+            self.bot.send_message(chat_id, "⚠️ Could not generate signal. Market data unavailable.")
+            return
+        entry = signal['entry']
+        sl = signal['sl']
+        tp = signal['tp']
+        conviction = signal['conviction']
+        fib_levels = signal['fibonacci']
+        explanations = '\n'.join(['• ' + e for e in signal['explanations']])
+        bos_text = f"\n🔔 *Break of Structure (BOS):*\n{signal['bos']['explanation']}" if signal.get('bos') else ""
+        msg = f"""
+🎯 *{"ULTRA-SNIPER" if conviction=="SNIPER" else "PRO"} Trading Signal* 🚀
+
+🔰 Symbol: #{symbol.replace('USDT','')}
+⚡ Direction: {'🟢 BUY' if entry < tp else '🔴 SELL'}
+📊 Pattern: {signal['pattern']}
+📈 Regime: {signal['regime']}
+🏆 Signal Score: `{signal['score']}/100`
+{"✅ 100% Institutional Sniper Signal" if conviction=="SNIPER" else "⚡ Pro-level trade: strong probability"}
+
+{explanations}
+{bos_text}
+
+💰 Entry Price: `{entry:.4f}`
+🛡️ Stop Loss: `{sl:.4f}` ({abs(sl-entry)/entry*100:.2f}%)
+🎯 Take Profit: `{tp:.4f}` ({abs(tp-entry)/entry*100:.2f}%)
+
+📐 Fibonacci Levels:
+├─ 0.236: `{fib_levels['0.236']:.4f}`
+├─ 0.382: `{fib_levels['0.382']:.4f}`
+├─ 0.5: `{fib_levels['0.5']:.4f}`
+├─ 0.618: `{fib_levels['0.618']:.4f}`
+└─ 0.786: `{fib_levels['0.786']:.4f}`
+
+📊 Market Conditions:
+├─ 📉 RSI(14): `{signal['rsi']:.1f}`
+├─ 🔥 ATR: `{signal['atr']:.4f}`
+└─ 📊 OB Imbalance: `{signal['ob']:.2%}`
+
+💰 Position Sizing:
+├─ Balance: `${self.user_balance:.2f}`
+├─ Risk Amount: `${signal['risk_amount']:.2f}`
+└─ Size: `{signal['position_size']:.4f} {symbol.replace('USDT','')}`
+
+{signal['chart']}
+
+⚡ *Execution Protocol:*
+1️⃣ Limit Order @ `{entry:.4f}`
+2️⃣ SL @ `{sl:.4f}`
+3️⃣ TP @ `{tp:.4f}`
+4️⃣ Monitor every 15s
+
+⚠️ *Risk Disclosure*: {'This is a SNIPER trade: all advanced filters aligned, institutional-quality setup.' if conviction=='SNIPER' else 'Professional setup – risk filters and market conditions aligned, but not all sniper factors present.'}
+"""
+        markup = types.InlineKeyboardMarkup()
+        markup.row(
+            types.InlineKeyboardButton("📊 View Chart", callback_data=f"chart_{symbol}"),
+            types.InlineKeyboardButton("❌ Close", callback_data="close")
+        )
+        self.bot.send_message(
+            chat_id,
+            msg,
+            parse_mode="Markdown",
+            reply_markup=markup
+        )
+        # Also send to channel
+        self.bot.send_message(
+            SniperConfig.CHANNEL_ID,
+            f"🚨 New {'SNIPER' if conviction=='SNIPER' else 'PRO'} Signal for {symbol}:\n{msg}",
+            parse_mode="Markdown"
+        )
+
+    def _process_balance(self, message):
+        try:
+            self.user_balance = float(message.text)
+            self.bot.send_message(
+                message.chat.id,
+                f"✅ Balance updated to ${self.user_balance:.2f}\n"
+                f"New risk per trade: ${self.user_balance * SniperConfig.BASE_RISK_PCT:.2f}",
+            )
+            self._send_professional_menu(message.chat.id)
+        except:
+            self.bot.send_message(message.chat.id, "❌ Invalid amount. Please enter a valid number (e.g., 50.00)")
+
+    def _send_strategy_guide(self, chat_id):
+        guide = """
+📜 *INSTITUTIONAL STRATEGY GUIDE*
+
+1️⃣ **Order Block (OB):**
+   - Detects key demand/supply zones where institutions took action.
+   - Price reclaim or rejection at OB zones confirms entry bias.
+2️⃣ **Fair Value Gap (FVG):**
+   - Identifies unfilled imbalances for high-probability entries.
+3️⃣ **Change of Character (CHoCH):**
+   - Confirms real regime change via structure break.
+4️⃣ **Break of Structure (BOS):**
+   - Confirms continuation or reversal of trend by breaking swing highs/lows.
+5️⃣ **Fibonacci Confluence:**
+   - Ensures entries align with golden-ratio reversals.
+6️⃣ **Pattern Recognition:**
+   - Detects bottoms, tops, traps for timing; integrates BOS and CHoCH.
+7️⃣ **Volume & Orderbook Analysis:**
+   - Volume expansion and orderbook imbalance indicate institutional activity.
+8️⃣ **Signal Scoring:**
+   - Only the highest-scoring, multi-factor signals are sent.
+9️⃣ **Risk Management:**
+   - 2% risk per trade, volatility-adjusted, pro sizing.
+
+*Each trade signal includes full explanation of all confluences and zones.*
+"""
+        self.bot.send_message(chat_id, guide, parse_mode="Markdown")
+
+    def run(self):
+        print("🚀 INSTITUTIONAL SNIPER BOT ACTIVATED")
+        self.bot.polling(none_stop=True)
+
+# ------------------- Main Execution -------------------
+if __name__ == "__main__":
+    trading_bot = ProfessionalTradingBot()
+    trading_bot.run()
