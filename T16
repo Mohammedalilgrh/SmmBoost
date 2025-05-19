@@ -667,3 +667,4 @@ Select an option below:
 if __name__ == "__main__":
     trading_bot = ProfessionalTradingBot()
     trading_bot.run()
+ 
