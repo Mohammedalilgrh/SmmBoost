@@ -1,6 +1,5 @@
 Flask
 requests==2.31.0
-sqlite3
 python-telegram-bot==20.6
 instagrapi==2.0.0
 tiktok-api==1.0.7
