@@ -1,6 +1,0 @@
-BINANCE_API_KEY = "Uv4M7OYObKHtH2uEoYkWPxxJdYiHg7mlFIFOE5mx3CzYbot1XjexR9Qhrp2EDBKl"
-BINANCE_SECRET_KEY = "BcDyrmS46rDra0oVGiGxdIdaeLLTfjo2fySHMsDquzI3fBL6NP4zHYfuL2ufqwyD"
-TELEGRAM_TOKEN = "7970489926:AAGjDmazd_EXkdT1cv8Lh8aNGZ1hPlkbcJg"
-CHANNEL_ID = "@tradegrh"
-INITIAL_BALANCE = 5.0  # رأس المال $5
-TEST_MODE = True  # وضع الاختبار
