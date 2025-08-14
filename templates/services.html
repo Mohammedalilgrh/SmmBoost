@@ -1,0 +1,98 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SMM Services - Free SMM Panel</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: Arial, sans-serif; background: #f5f5f5; }
+        .header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 20px 0; text-align: center; }
+        .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
+        .nav { background: white; padding: 15px 0; box-shadow: 0 2px 10px rgba(0,0,0,0.1); margin-bottom: 30px; }
+        .nav ul { list-style: none; display: flex; justify-content: center; }
+        .nav li { margin: 0 20px; }
+        .nav a { text-decoration: none; color: #333; font-weight: bold; padding: 10px 15px; border-radius: 5px; transition: all 0.3s; }
+        .nav a:hover { background: #667eea; color: white; }
+        .service-card { background: white; padding: 20px; border-radius: 10px; margin-bottom: 20px; box-shadow: 0 5px 15px rgba(0,0,0,0.1); }
+        .service-form { display: grid; grid-template-columns: 1fr 200px 100px 120px; gap: 15px; align-items: center; }
+        .input-field { padding: 10px; border: 2px solid #ddd; border-radius: 5px; font-size: 14px; }
+        .btn { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 10px 20px; border: none; border-radius: 5px; cursor: pointer; transition: all 0.3s; }
+        .btn:hover { transform: translateY(-1px); }
+        .platform-badge { padding: 5px 10px; border-radius: 15px; font-size: 12px; font-weight: bold; }
+        .instagram { background: #e1306c; color: white; }
+        .tiktok { background: #000; color: white; }
+        .telegram { background: #0088cc; color: white; }
+        @media (max-width: 768px) {
+            .service-form { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🚀 Free SMM Services</h1>
+        <p>Choose your service and start boosting!</p>
+    </div>
+    
+    <nav class="nav">
+        <ul>
+            <li><a href="/">Home</a></li>
+            <li><a href="/services">Services</a></li>
+            <li><a href="/orders">My Orders</a></li>
+        </ul>
+    </nav>
+    
+    <div class="container">
+        {% for service in services %}
+        <div class="service-card">
+            <h3>{{ service[1] }} <span class="platform-badge {{ service[2].lower() }}">{{ service[2] }}</span></h3>
+            <p>Min: {{ service[4] }} | Max: {{ service[5] }} | Price: FREE</p>
+            <br>
+            <div class="service-form">
+                <input type="url" class="input-field" placeholder="Enter URL (Instagram/TikTok post or profile)" id="url-{{ service[0] }}">
+                <input type="number" class="input-field" placeholder="Quantity" min="{{ service[4] }}" max="{{ service[5] }}" id="quantity-{{ service[0] }}">
+                <button class="btn" onclick="placeOrder({{ service[0] }})">Order Now</button>
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+
+    <script>
+        function placeOrder(serviceId) {
+            const url = document.getElementById(`url-${serviceId}`).value;
+            const quantity = document.getElementById(`quantity-${serviceId}`).value;
+            
+            if (!url || !quantity) {
+                alert('Please fill in all fields');
+                return;
+            }
+            
+            fetch('/order', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    service_id: serviceId,
+                    target_url: url,
+                    quantity: parseInt(quantity)
+                })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.error) {
+                    alert('Error: ' + data.error);
+                } else {
+                    alert('Order placed successfully! Order ID: ' + data.order_id);
+                    document.getElementById(`url-${serviceId}`).value = '';
+                    document.getElementById(`quantity-${serviceId}`).value = '';
+                }
+            })
+            .catch(error => {
+                alert('Error placing order: ' + error);
+            });
+        }
+    </script>
+</body>
+</html>
